@@ -1,95 +1,134 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
-	"crypto-observer/internal/collector"
 	"crypto-observer/internal/model"
+
+	"github.com/stretchr/testify/require"
 )
 
-// ---- фейки хранилища ----
+// ---- fakes ----
 
 type fakeStorage struct {
-	prices []model.Price
+	mu        sync.Mutex
+	gotSym    string
+	gotTS     int64
+	retPrice  *model.Price
+	retErr    error
+	saveCalls int
 }
 
-func (f *fakeStorage) SavePrice(symbol string, ts int64, price float64) error {
-	f.prices = append(f.prices, model.Price{Symbol: symbol, Timestamp: ts, Price: price})
+func (f *fakeStorage) SavePrice(ctx context.Context, p model.Price) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveCalls++
 	return nil
 }
 
-func (f *fakeStorage) GetClosestPrice(symbol string, ts int64) (*model.Price, bool, error) {
-	for _, p := range f.prices {
-		if p.Symbol == symbol && p.Timestamp <= ts {
-			return &p, true, nil
-		}
-	}
-	return nil, false, nil
+func (f *fakeStorage) GetClosestPrice(ctx context.Context, symbol string, ts int64) (*model.Price, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gotSym = symbol
+	f.gotTS = ts
+	return f.retPrice, f.retErr
 }
 
-// ---- тесты ----
+// ---- helpers ----
 
-func TestService_AddCurrency(t *testing.T) {
+func newSvcWith(storage Storage) *Service {
+	// baseURL/timeout не важны — в тестах не даём коллектору тикаать
+	return NewService(storage /*defaultPeriod*/, 1, "http://localhost", 5*time.Second)
+}
+
+func sleepMS(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }
+
+// ---- tests ----
+
+func TestService_GetPrice_ZeroTS_UsesNow(t *testing.T) {
+	fs := &fakeStorage{retPrice: &model.Price{Symbol: "btc", TS: 1, Price: 2}}
+	s := newSvcWith(fs)
+
+	start := time.Now().Unix()
+	got, err := s.GetPrice("btc", 0)
+	require.NoError(t, err)
+	require.Equal(t, fs.retPrice, got)
+
+	// проверяем, что в сторадж ушёл ts "примерно сейчас"
+	require.Equal(t, "btc", fs.gotSym)
+	require.InDelta(t, start, fs.gotTS, 2, "ts should be near now (seconds)")
+}
+
+func TestService_GetPrice_PassesTS(t *testing.T) {
+	fs := &fakeStorage{retPrice: &model.Price{Symbol: "eth", TS: 111, Price: 222}}
+	s := newSvcWith(fs)
+
+	got, err := s.GetPrice("eth", 12345)
+	require.NoError(t, err)
+	require.Equal(t, fs.retPrice, got)
+	require.Equal(t, int64(12345), fs.gotTS)
+	require.Equal(t, "eth", fs.gotSym)
+}
+
+func TestService_GetPrice_PropagatesError(t *testing.T) {
+	fs := &fakeStorage{retErr: errors.New("db boom")}
+	s := newSvcWith(fs)
+
+	got, err := s.GetPrice("btc", 100)
+	require.Error(t, err)
+	require.Nil(t, got)
+}
+
+func TestService_AddCurrency_StartsCollector_AndRemoveStops(t *testing.T) {
 	fs := &fakeStorage{}
-	mockPrice := func(symbol string) (float64, error) { return 999.99, nil }
+	s := newSvcWith(fs)
 
-	coll := collector.NewCollector(fs, mockPrice) // новая сигнатура (storage, getPriceFunc)
-	s := NewService(fs, coll)
+	// длинный период — чтобы тики не успели сработать в тесте
+	err := s.AddCurrency("btc", 3600)
+	require.NoError(t, err)
 
-	if err := s.AddCurrency("btc", 1); err != nil {
-		t.Fatalf("AddCurrency error: %v", err)
-	}
+	c, ok := s.collectors["btc"]
+	require.True(t, ok, "collector must be created")
+	require.True(t, c.Running(), "collector should be running after AddCurrency")
 
-	if !coll.Running("btc") {
-		t.Errorf("ожидалось, что для btc будет запущен сбор цен")
-	}
+	// Теперь удаляем и убеждаемся, что остановился
+	err = s.RemoveCurrency("btc")
+	require.NoError(t, err)
+	sleepMS(30)
+	require.False(t, c.Running(), "collector should stop after RemoveCurrency")
 }
 
-func TestService_RemoveCurrency(t *testing.T) {
+func TestService_AddCurrency_DefaultPeriodUsed_WhenZero(t *testing.T) {
 	fs := &fakeStorage{}
-	mockPrice := func(symbol string) (float64, error) { return 123.45, nil }
-
-	coll := collector.NewCollector(fs, mockPrice)
-	s := NewService(fs, coll)
-
-	if err := s.AddCurrency("eth", 1); err != nil {
-		t.Fatalf("prepare AddCurrency error: %v", err)
-	}
-	if !coll.Running("eth") {
-		t.Fatalf("подготовка: ожидалось, что eth запущен")
-	}
-
-	if err := s.RemoveCurrency("eth"); err != nil {
-		t.Fatalf("RemoveCurrency error: %v", err)
-	}
-	if coll.Running("eth") {
-		t.Errorf("ожидалось, что для eth сбор будет остановлен")
-	}
+	s := newSvcWith(fs)
+	// periodSec <= 0 => берётся defaultPer
+	err := s.AddCurrency("eth", 0)
+	require.NoError(t, err)
+	c, ok := s.collectors["eth"]
+	require.True(t, ok)
+	require.True(t, c.Running())
+	// уборка
+	_ = s.RemoveCurrency("eth")
+	sleepMS(20)
 }
 
-func TestService_GetPrice(t *testing.T) {
-	// заранее положим запись, как будто коллектор уже писал
-	fs := &fakeStorage{
-		prices: []model.Price{
-			{Symbol: "btc", Timestamp: 111, Price: 50000},
-		},
-	}
-	mockPrice := func(symbol string) (float64, error) { return 50000, nil }
+func TestService_AddCurrency_SecondCallDoesNotDuplicate(t *testing.T) {
+	fs := &fakeStorage{}
+	s := newSvcWith(fs)
 
-	coll := collector.NewCollector(fs, mockPrice)
-	s := NewService(fs, coll)
+	require.NoError(t, s.AddCurrency("btc", 3600))
+	first := s.collectors["btc"]
+	require.NotNil(t, first)
 
-	resp, err := s.GetPrice("btc", "111")
-	if err != nil {
-		t.Fatalf("GetPrice error: %v", err)
-	}
-	if resp == nil {
-		t.Fatalf("ожидался непустой ответ")
-	}
-	if resp.Price != 50000 {
-		t.Errorf("ожидалось 50000, получили %v", resp.Price)
-	}
-	if resp.Timestamp != 111 {
-		t.Errorf("ожидался ts=111, получили %v", resp.Timestamp)
-	}
+	// повторный вызов — коллектор уже запущен; должен остаться тем же
+	require.NoError(t, s.AddCurrency("btc", 1))
+	second := s.collectors["btc"]
+
+	require.Same(t, first, second, "should not replace already running collector")
+	_ = s.RemoveCurrency("btc")
+	sleepMS(20)
 }

@@ -5,12 +5,12 @@ type AddCurrencyRequest struct {
 	Period int    `json:"period"`
 }
 
-type RemoveCurrencyRequest struct {
+type RemoveReq struct {
 	Symbol string `json:"symbol"`
 }
 
 type PriceResponse struct {
-	Coin      string  `json:"coin"`
-	Timestamp int64   `json:"timestamp"`
-	Price     float64 `json:"price"`
+	Symbol string `json:"coin"`
+	TS     int64  `json:"timestamp"`
+	Price  int64  `json:"price"`
 }

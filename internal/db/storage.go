@@ -1,78 +1,96 @@
+// internal/db/storage.go
 package db
 
 import (
-	"database/sql"
+	"context"
+	"errors"
 
-	"crypto-observer/internal/logger"
 	"crypto-observer/internal/model"
+	"crypto-observer/pkg/logger"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type StorageInterface interface {
-	SavePrice(symbol string, ts int64, price float64) error
-	GetClosestPrice(symbol string, ts int64) (*model.Price, bool, error)
+type poolIface interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Close()
 }
 
 type Storage struct {
-	db *sql.DB
+	pool poolIface
 }
 
 func NewStorage(dsn string) (*Storage, error) {
-	db, err := sql.Open("postgres", dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := EnsureSchema(db); err != nil {
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
 		return nil, err
 	}
-	return &Storage{db: db}, nil
+	st := &Storage{pool: pool}
+	if err := st.EnsureSchema(context.Background()); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
-func EnsureSchema(db *sql.DB) error {
-	const schema = `
+func newWithPool(p poolIface) *Storage { return &Storage{pool: p} }
+
+func (s *Storage) EnsureSchema(ctx context.Context) error {
+	const q = `
 CREATE TABLE IF NOT EXISTS prices (
-	id SERIAL PRIMARY KEY,
-	symbol TEXT NOT NULL,
-	timestamp BIGINT NOT NULL,
-	price DOUBLE PRECISION NOT NULL
+    id           BIGSERIAL PRIMARY KEY,
+    symbol       VARCHAR(32) NOT NULL,
+    ts           BIGINT      NOT NULL,
+    price_cents  BIGINT      NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_prices_symbol_ts ON prices(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_prices_symbol_ts ON prices(symbol, ts DESC);
 `
-	if _, err := db.Exec(schema); err != nil {
-		logger.Log.WithError(err).Error("DB: EnsureSchema failed")
-		return err
-	}
-	logger.Log.Info("DB: schema ensured")
-	return nil
-}
-
-func (s *Storage) SavePrice(symbol string, ts int64, price float64) error {
-	logger.Log.WithFields(logger.Fields{"symbol": symbol, "ts": ts, "price": price}).Debug("DB: SavePrice")
-	_, err := s.db.Exec(`INSERT INTO prices (symbol, timestamp, price) VALUES ($1, $2, $3)`, symbol, ts, price)
+	_, err := s.pool.Exec(ctx, q)
 	if err != nil {
-		logger.Log.WithError(err).Error("DB: SavePrice failed")
+		logger.L().WithError(err).Error("DB: EnsureSchema failed")
 	}
 	return err
 }
 
-func (s *Storage) GetClosestPrice(symbol string, ts int64) (*model.Price, bool, error) {
-	logger.Log.WithFields(logger.Fields{"symbol": symbol, "ts": ts}).Debug("DB: GetClosestPrice")
-	row := s.db.QueryRow(
-		`SELECT symbol, timestamp, price
-		 FROM prices
-		 WHERE symbol = $1 AND timestamp <= $2
-		 ORDER BY timestamp DESC
-		 LIMIT 1`, symbol, ts,
-	)
-	var p model.Price
-	if err := row.Scan(&p.Symbol, &p.Timestamp, &p.Price); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, false, nil
-		}
-		logger.Log.WithError(err).Error("DB: GetClosestPrice failed")
-		return nil, false, err
+func (s *Storage) SavePrice(ctx context.Context, p model.Price) error {
+	const q = `INSERT INTO prices (symbol, ts, price_cents) VALUES ($1, $2, $3)`
+	_, err := s.pool.Exec(ctx, q, p.Symbol, p.TS, p.Price)
+	if err != nil {
+		logger.L().WithError(err).Error("DB: SavePrice failed")
 	}
-	return &p, true, nil
+	return err
+}
+
+func (s *Storage) GetClosestPrice(ctx context.Context, symbol string, ts int64) (*model.Price, error) {
+	const q = `
+SELECT symbol, ts, price_cents
+FROM prices
+WHERE symbol = $1 AND ts <= $2
+ORDER BY ts DESC
+LIMIT 1`
+	row := s.pool.QueryRow(ctx, q, symbol, ts)
+
+	var out model.Price
+	if err := row.Scan(&out.Symbol, &out.TS, &out.Price); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		logger.L().WithError(err).Error("DB: GetClosestPrice failed")
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *Storage) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
 }

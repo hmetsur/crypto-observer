@@ -1,0 +1,16 @@
+# configs/config.yaml
+server:
+  addr: ":8080"
+
+db:
+  dsn: "postgres://user:pass@db:5432/crypto?sslmode=disable"
+
+collector:
+  default_period_seconds: 10
+
+coingecko:
+  base_url: "https://api.coingecko.com/api/v3"
+  timeout_s: 5
+
+log:
+  level: "info"

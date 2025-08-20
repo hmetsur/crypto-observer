@@ -85,7 +85,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/model.PriceResponse"
+                            "$ref": "#/definitions/model.PriceResponseonse"
                         }
                     },
                     "404": {
@@ -147,7 +147,7 @@ const docTemplate = `{
                 }
             }
         },
-        "model.PriceResponse": {
+        "model.PriceResponseonse": {
             "type": "object",
             "properties": {
                 "coin": {

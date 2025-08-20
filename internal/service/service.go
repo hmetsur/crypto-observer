@@ -1,73 +1,67 @@
+// internal/service/service.go
 package service
 
 import (
-	"errors"
-	"fmt"
-	"strconv"
+	"context"
+	"time"
 
-	"crypto-observer/internal/db"
-	"crypto-observer/internal/logger"
+	"crypto-observer/internal/coingecko"
 	"crypto-observer/internal/model"
+	"crypto-observer/pkg/logger"
 )
 
-type Collector interface {
-	Start(symbol string, period int)
-	Stop(symbol string)
-}
-
-type CurrencyService interface {
-	AddCurrency(symbol string, period int) error
-	RemoveCurrency(symbol string) error
-	GetPrice(symbol, ts string) (*model.PriceResponse, error)
+type Storage interface {
+	SavePrice(ctx context.Context, p model.Price) error
+	GetClosestPrice(ctx context.Context, symbol string, ts int64) (*model.Price, error)
 }
 
 type Service struct {
-	storage   db.StorageInterface
-	collector Collector
+	st         Storage
+	collectors map[string]*collector
+	defaultPer int
+	priceCli   *coingecko.Client
 }
 
-var _ CurrencyService = (*Service)(nil)
-
-func NewService(s db.StorageInterface, c Collector) *Service {
-	return &Service{storage: s, collector: c}
+func NewService(st Storage, defaultPeriod int, cgBaseURL string, timeout time.Duration) *Service {
+	return &Service{
+		st:         st,
+		collectors: make(map[string]*collector),
+		defaultPer: defaultPeriod,
+		priceCli:   coingecko.New(cgBaseURL, timeout),
+	}
 }
 
-func (s *Service) AddCurrency(symbol string, period int) error {
-	logger.Log.WithFields(logger.Fields{"symbol": symbol, "period": period}).Info("Service: AddCurrency")
-	s.collector.Start(symbol, period)
+func (s *Service) AddCurrency(symbol string, periodSec int) error {
+	if periodSec <= 0 {
+		periodSec = s.defaultPer
+	}
+	if c, ok := s.collectors[symbol]; ok && c.Running() {
+		return nil
+	}
+	c := newCollector(symbol, time.Duration(periodSec)*time.Second, s.st, s.priceCli)
+	s.collectors[symbol] = c
+	c.Start()
+	logger.L().WithField("symbol", symbol).Info("Service: AddCurrency")
 	return nil
 }
 
 func (s *Service) RemoveCurrency(symbol string) error {
-	logger.Log.WithField("symbol", symbol).Info("Service: RemoveCurrency")
-	s.collector.Stop(symbol)
+	if c, ok := s.collectors[symbol]; ok {
+		c.Stop()
+	}
+	logger.L().WithField("symbol", symbol).Info("Service: RemoveCurrency")
 	return nil
 }
 
-var (
-	ErrPriceNotFound    = errors.New("price not found")
-	ErrInvalidTimestamp = errors.New("invalid timestamp")
-)
+func (s *Service) GetPrice(symbol string, ts int64) (*model.Price, error) {
+	logger.L().WithFields(logger.Fields{
+		"symbol": symbol,
+		"ts":     ts,
+	}).Info("Service: GetPrice")
 
-func (s *Service) GetPrice(symbol, ts string) (*model.PriceResponse, error) {
-	logger.Log.WithFields(logger.Fields{"symbol": symbol, "timestamp": ts}).Info("Service: GetPrice")
-
-	timestamp, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		logger.Log.WithError(err).Warn("Service: bad timestamp")
-		// заворачиваем исходную ошибку в свой сентинел
-		return nil, fmt.Errorf("%w: %v", ErrInvalidTimestamp, err)
+	// если ts == 0 — используем текущий момент
+	if ts == 0 {
+		ts = time.Now().Unix()
 	}
-
-	p, found, err := s.storage.GetClosestPrice(symbol, timestamp)
-	if err != nil {
-		logger.Log.WithError(err).Error("Service: storage error")
-		return nil, err
-	}
-	if !found {
-		logger.Log.WithField("symbol", symbol).Warn("Service: price not found")
-		return nil, ErrPriceNotFound
-	}
-
-	return &model.PriceResponse{Coin: symbol, Timestamp: p.Timestamp, Price: p.Price}, nil
+	return s.st.GetClosestPrice(context.Background(), symbol, ts)
 }
